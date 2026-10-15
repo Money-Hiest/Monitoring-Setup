@@ -1,0 +1,176 @@
+pipeline {
+    agent any
+
+    // Phase 1 of monitoring onboarding: tags the server so it's
+    // identifiable as a Grafana-monitored asset. Does NOT touch the
+    // Prometheus/Grafana target file — that's a separate phase 2
+    // pipeline that will run against the dedicated Grafana server.
+    //
+    // node_exporter installation is handled separately by the
+    // Setup-NodeExporter pipeline (unchanged, run independently).
+
+    parameters {
+        string(
+            name: 'DROPLET_NAME',
+            defaultValue: '',
+            description: 'Name of the droplet to tag. Required.'
+        )
+        string(
+            name: 'DROPLET_IP',
+            defaultValue: '',
+            description: 'Public IP of the droplet, used only as a sanity check against the resolved droplet. Optional but recommended.'
+        )
+    }
+
+    environment {
+        TAG_NAME = 'AIL-FW-Grafana-Monitoring'
+    }
+
+    stages {
+
+        stage('Validate Parameters') {
+            steps {
+                script {
+                    if (!params.DROPLET_NAME?.trim()) {
+                        error("DROPLET_NAME is required.")
+                    }
+                    if (params.DROPLET_IP?.trim() && !(params.DROPLET_IP ==~ /^([0-9]{1,3}\.){3}[0-9]{1,3}$/)) {
+                        error("DROPLET_IP does not look like a valid IPv4 address: ${params.DROPLET_IP}")
+                    }
+                    echo "Target: ${params.DROPLET_NAME}${params.DROPLET_IP ? " (${params.DROPLET_IP})" : ''}"
+                }
+            }
+        }
+
+        stage('Resolve Droplet') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'digitalocean-token',
+                        variable: 'DIGITALOCEAN_ACCESS_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        echo "Looking up droplet: $DROPLET_NAME"
+
+                        MATCH=$(
+                            doctl compute droplet list \
+                                --format ID,Name,PublicIPv4 \
+                                --no-header |
+                            awk -v name="$DROPLET_NAME" '$2 == name'
+                        )
+
+                        if [[ -z "$MATCH" ]]; then
+                            echo "ERROR: No droplet found with name: $DROPLET_NAME"
+                            exit 1
+                        fi
+
+                        MATCH_COUNT=$(echo "$MATCH" | wc -l)
+                        if [[ "$MATCH_COUNT" -gt 1 ]]; then
+                            echo "ERROR: Multiple droplets found with name: $DROPLET_NAME"
+                            echo "$MATCH"
+                            exit 1
+                        fi
+
+                        RESOLVED_ID=$(echo "$MATCH" | awk '{print $1}')
+                        RESOLVED_IP=$(echo "$MATCH" | awk '{print $3}')
+
+                        echo "Resolved droplet ID: $RESOLVED_ID"
+                        echo "Resolved public IP : $RESOLVED_IP"
+
+                        if [[ -n "${DROPLET_IP:-}" && "$RESOLVED_IP" != "$DROPLET_IP" ]]; then
+                            echo "ERROR: Resolved IP ($RESOLVED_IP) does not match the IP you passed ($DROPLET_IP)."
+                            echo "Refusing to tag — this looks like the wrong droplet or a stale/reused name."
+                            exit 1
+                        fi
+
+                        echo "$RESOLVED_ID" > droplet_id.txt
+                    '''
+                }
+            }
+        }
+
+        stage('Tag Droplet') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'digitalocean-token',
+                        variable: 'DIGITALOCEAN_ACCESS_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        DROPLET_ID=$(cat droplet_id.txt)
+
+                        echo "Ensuring tag exists: $TAG_NAME"
+                        doctl compute tag create "$TAG_NAME" || echo "Tag may already exist, continuing."
+
+                        # NOTE: doctl's "compute tag" group only manages tag
+                        # objects (create/get/list/delete) — it has no
+                        # subcommand to attach an existing tag to an
+                        # existing resource. That part of the DigitalOcean
+                        # API is called directly here.
+                        echo "Applying tag $TAG_NAME to droplet $DROPLET_ID..."
+
+                        HTTP_STATUS=$(
+                            curl -s -o /tmp/tag_response.json -w "%{http_code}" \
+                                -X POST \
+                                -H "Authorization: Bearer $DIGITALOCEAN_ACCESS_TOKEN" \
+                                -H "Content-Type: application/json" \
+                                -d "{\\"resources\\": [{\\"resource_id\\": \\"$DROPLET_ID\\", \\"resource_type\\": \\"droplet\\"}]}" \
+                                "https://api.digitalocean.com/v2/tags/$TAG_NAME/resources"
+                        )
+
+                        if [[ "$HTTP_STATUS" != "204" ]]; then
+                            echo "ERROR: Tag assignment failed (HTTP $HTTP_STATUS)"
+                            cat /tmp/tag_response.json || true
+                            exit 1
+                        fi
+
+                        echo "✅ Tag applied."
+                    '''
+                }
+            }
+        }
+
+        stage('Verify') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'digitalocean-token',
+                        variable: 'DIGITALOCEAN_ACCESS_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+
+                        DROPLET_ID=$(cat droplet_id.txt)
+
+                        TAGS=$(doctl compute droplet get "$DROPLET_ID" --format Tags --no-header)
+
+                        echo "Current tags on $DROPLET_NAME: $TAGS"
+
+                        if [[ "$TAGS" != *"$TAG_NAME"* ]]; then
+                            echo "ERROR: Tag $TAG_NAME not found on droplet after apply."
+                            exit 1
+                        fi
+
+                        echo "✅ Confirmed: $DROPLET_NAME is tagged with $TAG_NAME"
+                    '''
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "${params.DROPLET_NAME} tagged with ${env.TAG_NAME} successfully."
+        }
+        failure {
+            echo "Tagging failed for ${params.DROPLET_NAME}."
+        }
+    }
+}
