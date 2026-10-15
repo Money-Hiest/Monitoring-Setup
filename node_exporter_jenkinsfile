@@ -1,0 +1,285 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'TARGET_IP',
+            defaultValue: '',
+            description: 'IP address of the existing DigitalOcean droplet to configure'
+        )
+    }
+
+    environment {
+        NEW_SERVER_IP = "${params.TARGET_IP}"   // kept so your downstream stage names still fit
+        ANSIBLE_USER   = 'ansible'
+        BOOTSTRAP_USER = 'root'
+        NODE_EXPORTER_VERSION = '1.12.1'
+    }
+
+    options {
+        timestamps()
+        ansiColor('xterm')
+    }
+
+    stages {
+
+        // ---------------------------------------------------------------- 2
+        stage('Validate Server IP') {
+            steps {
+                script {
+                    if (!env.NEW_SERVER_IP?.trim()) {
+                        error("TARGET_IP is empty or null — aborting before wasting the SSH-wait timeout")
+                    }
+                    // basic IP format sanity check
+                    if (!(env.NEW_SERVER_IP ==~ /^(\d{1,3}\.){3}\d{1,3}$/)) {
+                        error("TARGET_IP '${env.NEW_SERVER_IP}' does not look like a valid IPv4 address")
+                    }
+                    echo "Validated target IP: ${env.NEW_SERVER_IP}"
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- 3
+        stage('Wait for SSH') {
+            steps {
+                script {
+                    def ready = false
+                    for (int i = 1; i <= 30; i++) {
+                        def portOpen = sh(
+                            script: "nc -z -w5 ${env.NEW_SERVER_IP} 22",
+                            returnStatus: true
+                        ) == 0
+
+                        if (portOpen) {
+                            def sshOk = sh(
+                                script: """
+                                    ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                                        -o BatchMode=yes \
+                                        ${BOOTSTRAP_USER}@${env.NEW_SERVER_IP} 'echo ssh-ok'
+                                """,
+                                returnStatus: true
+                            ) == 0
+                            if (sshOk) {
+                                ready = true
+                                break
+                            }
+                        }
+                        echo "SSH not ready (attempt ${i}/30), sleeping 10s..."
+                        sleep(time: 10, unit: 'SECONDS')
+                    }
+                    if (!ready) {
+                        error("SSH did not become ready on ${env.NEW_SERVER_IP} within 300s")
+                    }
+                    echo "SSH handshake successful on ${env.NEW_SERVER_IP}"
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- 4
+        stage('Create Ansible User') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'deploy-ssh-key',
+                    keyFileVariable: 'DEPLOY_KEY',
+                    usernameVariable: 'DEPLOY_KEY_USER'
+                )]) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                            ${BOOTSTRAP_USER}@${NEW_SERVER_IP} \\
+                            DEPLOY_PUBKEY="$(ssh-keygen -y -f $DEPLOY_KEY)" \\
+                            'bash -s' <<'REMOTE_EOF'
+set -euo pipefail
+
+DEPLOY_PUBKEY="${DEPLOY_PUBKEY}"
+
+# --- idempotent user creation ---
+if id "$ANSIBLE_USER" &>/dev/null; then
+    echo "User '$ANSIBLE_USER' already exists — continuing"
+else
+    useradd -m -s /bin/bash "$ANSIBLE_USER"
+    echo "User '$ANSIBLE_USER' created"
+fi
+
+# --- deploy key (idempotent) ---
+mkdir -p /home/"$ANSIBLE_USER"/.ssh
+chmod 700 /home/"$ANSIBLE_USER"/.ssh
+touch /home/"$ANSIBLE_USER"/.ssh/authorized_keys
+grep -qxF "$DEPLOY_PUBKEY" /home/"$ANSIBLE_USER"/.ssh/authorized_keys \\
+    || echo "$DEPLOY_PUBKEY" >> /home/"$ANSIBLE_USER"/.ssh/authorized_keys
+chmod 600 /home/"$ANSIBLE_USER"/.ssh/authorized_keys
+chown -R "$ANSIBLE_USER":"$ANSIBLE_USER" /home/"$ANSIBLE_USER"/.ssh
+
+# --- restricted sudoers (whitelisted commands only) ---
+cat > /etc/sudoers.d/"$ANSIBLE_USER" <<'SUDOERS'
+ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter, \
+                              /bin/systemctl start node_exporter, \
+                              /bin/systemctl restart node_exporter, \
+                              /bin/systemctl stop node_exporter, \
+                              /bin/systemctl status node_exporter, \
+                              /bin/systemctl daemon-reload, \
+                              /usr/bin/tee /etc/systemd/system/node_exporter.service, \
+                              /bin/chown root\:root /etc/systemd/system/node_exporter.service, \
+                              /bin/chmod 644 /etc/systemd/system/node_exporter.service, \
+                              /bin/mkdir -p /opt/node_exporter, \
+                              /bin/cp /tmp/node_exporter-* /opt/node_exporter/, \
+                              /bin/chown -R node_exporter\:node_exporter /opt/node_exporter, \
+                              /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter, \
+                              /bin/id node_exporter, \
+                              /usr/bin/journalctl -u node_exporter *
+SUDOERS
+chmod 440 /etc/sudoers.d/"$ANSIBLE_USER"
+visudo -cf /etc/sudoers.d/"$ANSIBLE_USER"
+
+echo "Ansible user provisioning complete"
+REMOTE_EOF
+                    '''
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- 5
+        stage('Install Node Exporter') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'deploy-ssh-key',
+                    keyFileVariable: 'DEPLOY_KEY',
+                    usernameVariable: 'DEPLOY_KEY_USER'
+                )]) {
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                            -i $DEPLOY_KEY \\
+                            ${ANSIBLE_USER}@${NEW_SERVER_IP} \\
+                            NE_VERSION="${NODE_EXPORTER_VERSION}" \\
+                            'bash -s' <<'REMOTE_EOF'
+set -euo pipefail
+
+SUDO="sudo -n"   # fails loudly if a command isn't whitelisted
+
+# --- system user (idempotent) ---
+if $SUDO id node_exporter &>/dev/null; then
+    echo "node_exporter user already exists"
+else
+    $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter
+fi
+
+# --- binary (pinned, skip if already installed) ---
+if [ -x /opt/node_exporter/node_exporter ]; then
+    INSTALLED=$(/opt/node_exporter/node_exporter --version 2>&1 | awk 'NR==1{print $3}')
+    echo "node_exporter already installed: v${INSTALLED}"
+else
+    cd /tmp
+    curl -fL -o ne.tar.gz \\
+        "https://github.com/prometheus/node_exporter/releases/download/v${NE_VERSION}/node_exporter-${NE_VERSION}.linux-amd64.tar.gz"
+    tar xzf ne.tar.gz
+    $SUDO mkdir -p /opt/node_exporter
+    $SUDO cp "node_exporter-${NE_VERSION}.linux-amd64/node_exporter" /opt/node_exporter/
+    rm -rf ne.tar.gz "node_exporter-${NE_VERSION}.linux-amd64"
+    echo "node_exporter v${NE_VERSION} installed"
+fi
+$SUDO chown -R node_exporter:node_exporter /opt/node_exporter
+
+# --- systemd unit (write if missing) ---
+UNIT=/etc/systemd/system/node_exporter.service
+if [ -f "$UNIT" ]; then
+    echo "systemd unit already present"
+else
+    $SUDO tee "$UNIT" > /dev/null <<'UNIT_EOF'
+[Unit]
+Description=Prometheus Node Exporter
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+User=node_exporter
+Group=node_exporter
+Type=simple
+ExecStart=/opt/node_exporter/node_exporter \\
+  --web.listen-address=:9100 \\
+  --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|run|var/lib/docker/.+)($|/)'
+Restart=always
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target
+UNIT_EOF
+    $SUDO chown root:root "$UNIT"
+    $SUDO chmod 644 "$UNIT"
+fi
+
+$SUDO systemctl daemon-reload
+$SUDO systemctl enable --now node_exporter
+echo "node_exporter service enabled and started"
+REMOTE_EOF
+                    '''
+                }
+            }
+        }
+
+        // ---------------------------------------------------------------- 6
+        stage('Health Check') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'deploy-ssh-key',
+                    keyFileVariable: 'DEPLOY_KEY',
+                    usernameVariable: 'DEPLOY_KEY_USER'
+                )]) {
+                    script {
+                        def healthy = false
+                        for (int i = 1; i <= 10; i++) {
+                            def rc = sh(
+                                script: """
+                                    ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                                        -i ${DEPLOY_KEY} \\
+                                        ${ANSIBLE_USER}@${env.NEW_SERVER_IP} \\
+                                        'curl -sf http://localhost:9100/metrics > /dev/null'
+                                """,
+                                returnStatus: true
+                            ) == 0
+                            if (rc) { healthy = true; break }
+                            echo "Health check failed (attempt ${i}/10), retrying in 3s..."
+                            sleep(time: 3, unit: 'SECONDS')
+                        }
+                        if (!healthy) {
+                            error("node_exporter failed health check on ${env.NEW_SERVER_IP}:9100 after 10 attempts")
+                        }
+                        echo "node_exporter is serving metrics on :9100"
+                    }
+                }
+            }
+        }
+    }
+
+    // ------------------------------------------------------------------ 7
+    post {
+        success {
+            echo "Server ${env.NEW_SERVER_IP} provisioned + monitored (node_exporter :9100)"
+        }
+        // ---------------------------------------------------------------- 8
+        failure {
+            script {
+                if (env.NEW_SERVER_IP?.trim()) {
+                    withCredentials([sshUserPrivateKey(
+                        credentialsId: 'deploy-ssh-key',
+                        keyFileVariable: 'DEPLOY_KEY',
+                        usernameVariable: 'DEPLOY_KEY_USER'
+                    )]) {
+                        sh '''
+                            echo "===== node_exporter journal (last 20 lines) on ${NEW_SERVER_IP} ====="
+                            ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                                -i $DEPLOY_KEY \\
+                                ${ANSIBLE_USER}@${NEW_SERVER_IP} \\
+                                'sudo -n journalctl -u node_exporter -n 20 --no-pager' \\
+                                || echo "(could not fetch journal — server may not have reached node_exporter stage)"
+                        '''
+                    }
+                } else {
+                    echo "Failure occurred before server IP was known — nothing to diagnose on target."
+                }
+            }
+        }
+    }
+}
