@@ -1,0 +1,307 @@
+pipeline {
+    agent any
+
+    options {
+        withBuildUser()
+    }
+
+    parameters {
+        choice(
+            name: 'Approver Email ID',
+            choices: [
+                'vipin_kumar@adityagroup.com',
+                'sachin_kumar@adityagroup.com',
+                'prem_sharma@adityagroup.com',
+                'deepshikha_tripathi@adityagroup.com'
+            ],
+            description: 'Select the email address that should receive the approval request.'
+        )
+    }
+
+    environment {
+        ADMIN_EMAILS = 'vipin_kumar@adityagroup.com,sachin_kumar@adityagroup.com'
+        PROMETHEUS_HOST = '167.71.237.241'
+    }
+
+    stages {
+
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+
+        stage('Validate') {
+            steps {
+                sh '''
+                    set -e
+
+                    echo "=================================================="
+                    echo "Validating Files and Tools"
+                    echo "=================================================="
+
+                    git --version
+                    doctl version
+
+                    test -f scripts/droplet/config.sh
+                    test -f scripts/droplet/create.sh
+                    test -f scripts/droplet/droplet_names.txt
+
+                    chmod +x scripts/droplet/create.sh
+                    chmod +x scripts/droplet/config.sh
+
+                    echo "Validation successful"
+                '''
+            }
+        }
+
+        stage('DigitalOcean Authentication') {
+            steps {
+                withCredentials([
+                    string(
+                        credentialsId: 'digitalocean-token',
+                        variable: 'DIGITALOCEAN_ACCESS_TOKEN'
+                    )
+                ]) {
+                    sh '''
+                        set -e
+                        echo "DigitalOcean Authentication"
+                        doctl account get
+                        echo "DigitalOcean authentication successful"
+                    '''
+                }
+            }
+        }
+
+        stage('Approval Before Infrastructure Creation') {
+            steps {
+                script {
+                    String builder = env.BUILD_USER_ID?.trim()
+
+                    if (!builder) {
+                        error("Cannot identify the build initiator.")
+                    }
+
+                    echo "Build initiated by: ${builder}"
+
+                    String selectedApproverEmail =
+                        params['Approver Email ID']?.toString()?.trim()
+
+                    List<String> allowedApproverEmails = [
+                        'vipin_kumar@adityagroup.com',
+                        'sachin_kumar@adityagroup.com',
+                        'prem_sharma@adityagroup.com',
+                        'deepshikha_tripathi@adityagroup.com'
+                    ]
+
+                    if (!selectedApproverEmail ||
+                        !allowedApproverEmails.contains(selectedApproverEmail)) {
+                        error("Invalid or missing Approver Email ID.")
+                    }
+
+                    echo "Selected approver notification email: ${selectedApproverEmail}"
+
+                    emailext(
+                        to: selectedApproverEmail,
+                        subject: "[APPROVAL REQUIRED] ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        mimeType: 'text/html',
+                        body: """
+                            <html>
+                            <body>
+                                <h2>DigitalOcean Droplet Creation - Approval Required</h2>
+                                <p>A Jenkins pipeline is waiting for approval before creating DigitalOcean droplets.</p>
+                                <table border="1" cellpadding="6" cellspacing="0">
+                                    <tr><td><b>Pipeline</b></td><td>${env.JOB_NAME}</td></tr>
+                                    <tr><td><b>Build Number</b></td><td>#${env.BUILD_NUMBER}</td></tr>
+                                    <tr><td><b>Initiated By</b></td><td>${builder}</td></tr>
+                                    <tr><td><b>Selected Approver Email</b></td><td>${selectedApproverEmail}</td></tr>
+                                    <tr><td><b>Status</b></td><td>Waiting for approval</td></tr>
+                                </table>
+                                <p><a href="${env.BUILD_URL}">Open Jenkins Build and Approve</a></p>
+                                <p>Sign in to Jenkins and use the approval prompt to approve the request.</p>
+                            </body>
+                            </html>
+                        """
+                    )
+
+                    List<String> allowedApprovers = [
+                        'vipin_kumar',
+                        'sachin_kumar',
+                        'prem_sharma',
+                        'deepshikha_tripathi'
+                    ]
+
+                    def approvalResult = input(
+                        id: 'DigitalOceanApproval',
+                        message: """
+                            Approve DigitalOcean droplet creation?
+
+                            Build initiated by: ${builder}
+                            Notification sent to: ${selectedApproverEmail}
+
+                            Only authorized Jenkins users may approve.
+                            Self-approval is not allowed.
+                        """.stripIndent(),
+                        ok: 'Approve and Create Droplets',
+                        submitter: allowedApprovers.join(','),
+                        submitterParameter: 'APPROVER'
+                    )
+
+                    String approver = null
+
+                    if (approvalResult instanceof Map) {
+                        approver = approvalResult['APPROVER']?.toString()?.trim()
+                    } else if (approvalResult instanceof String) {
+                        approver = approvalResult.trim()
+                    }
+
+                    if (!approver) {
+                        approver = env.APPROVER?.trim()
+                    }
+
+                    if (!approver) {
+                        error("Approver ID is missing. Cannot safely continue.")
+                    }
+
+                    echo "Approval submitted by Jenkins identity: ${approver}"
+
+                    if (!allowedApprovers.contains(approver)) {
+                        error("Unauthorized approver: ${approver}")
+                    }
+
+                    if (approver.equalsIgnoreCase(builder)) {
+                        error(
+                            "Self-approval is not allowed. " +
+                            "Builder: ${builder}, Approver: ${approver}"
+                        )
+                    }
+
+                    env.APPROVER = approver
+                    env.SELECTED_APPROVER_EMAIL = selectedApproverEmail
+
+                    echo "Approval successful. Approved by: ${env.APPROVER}"
+                }
+            }
+        }
+
+        stage('Create Droplets') {
+            steps {
+                echo "Approved by Jenkins user: ${env.APPROVER}"
+
+                withCredentials([
+                    string(
+                        credentialsId: 'digitalocean-token',
+                        variable: 'DIGITALOCEAN_ACCESS_TOKEN'
+                    ),
+                    usernamePassword(
+                        credentialsId: 'prometheus-ssh-password',
+                        usernameVariable: 'PROMETHEUS_USER',
+                        passwordVariable: 'PROMETHEUS_SSH_PASSWORD'
+                    )
+                ]) {
+                    sh '''
+                        set -eu
+
+                        echo "=================================================="
+                        echo "Starting Droplet Creation"
+                        echo "=================================================="
+
+                        : "${PROMETHEUS_HOST:?PROMETHEUS_HOST is not configured}"
+                        : "${PROMETHEUS_USER:?Prometheus SSH username is missing}"
+                        : "${PROMETHEUS_SSH_PASSWORD:?Prometheus SSH password is missing}"
+
+                        command -v doctl >/dev/null 2>&1 || {
+                            echo "ERROR: doctl is not installed."
+                            exit 1
+                        }
+
+                        command -v sshpass >/dev/null 2>&1 || {
+                            echo "ERROR: sshpass is not installed."
+                            exit 1
+                        }
+
+                        cd scripts/droplet
+                        chmod +x create.sh
+                        ./create.sh
+                    '''
+                }
+
+                // --------------------------------------------------------
+                // NEW: archive the droplet-info.json that create.sh writes
+                // so the separate watcher pipeline can pull it via
+                // copyArtifacts instead of scraping console output.
+                // This is the only change in this file.
+                // --------------------------------------------------------
+                archiveArtifacts(
+                    artifacts: 'scripts/droplet/droplet-info.json',
+                    fingerprint: true
+                )
+            }
+        }
+    }
+
+    post {
+        success {
+            echo 'DigitalOcean infrastructure created successfully.'
+        }
+
+        failure {
+            echo 'DigitalOcean infrastructure creation failed.'
+        }
+
+        aborted {
+            echo 'Pipeline execution was aborted.'
+        }
+
+        always {
+            script {
+                String finalStatus =
+                    currentBuild.currentResult ?: 'UNKNOWN'
+
+                String builderName =
+                    env.BUILD_USER_ID?.trim() ?: 'Unknown'
+
+                String approverName =
+                    env.APPROVER?.trim() ?: 'Not approved / not recorded'
+
+                String selectedEmail =
+                    env.SELECTED_APPROVER_EMAIL ?:
+                    params['Approver Email ID']?.toString() ?:
+                    'Not selected'
+
+                try {
+                    emailext(
+                        to: env.ADMIN_EMAILS,
+                        subject: "[Jenkins ${finalStatus}] ${env.JOB_NAME} #${env.BUILD_NUMBER}",
+                        mimeType: 'text/html',
+                        body: """
+                            <html>
+                            <body>
+                                <h2>Jenkins Pipeline Execution Report</h2>
+                                <table border="1" cellpadding="6" cellspacing="0">
+                                    <tr><td><b>Pipeline</b></td><td>${env.JOB_NAME}</td></tr>
+                                    <tr><td><b>Build Number</b></td><td>#${env.BUILD_NUMBER}</td></tr>
+                                    <tr><td><b>Final Status</b></td><td>${finalStatus}</td></tr>
+                                    <tr><td><b>Initiated By</b></td><td>${builderName}</td></tr>
+                                    <tr><td><b>Selected Approver Email</b></td><td>${selectedEmail}</td></tr>
+                                    <tr><td><b>Approved By</b></td><td>${approverName}</td></tr>
+                                    <tr><td><b>Duration</b></td><td>${currentBuild.durationString}</td></tr>
+                                </table>
+                                <p><a href="${env.BUILD_URL}">Open Jenkins Build Details</a></p>
+                                <p><a href="${env.BUILD_URL}console">View Console Output</a></p>
+                                <p>This is an automated Jenkins notification.</p>
+                            </body>
+                            </html>
+                        """
+                    )
+
+                    echo "Final notification sent to administrators."
+                } catch (Exception mailError) {
+                    echo "WARNING: Final email notification failed: ${mailError.getMessage()}"
+                }
+
+                echo "Pipeline completed with status: ${finalStatus}"
+            }
+        }
+    }
+}

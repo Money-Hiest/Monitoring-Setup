@@ -1,0 +1,81 @@
+pipeline {
+    agent any
+
+    // Watches Digital-Ocean/OTA/Create/Create-Droplet and fires
+    // automatically whenever it completes with SUCCESS. Pure review
+    // gate: shows what was created, waits for a human to click
+    // Continue or Abort. Triggers nothing further either way.
+    triggers {
+        upstream(
+            upstreamProjects: 'Digital-Ocean/OTA/Create/Create-Droplet',
+            threshold: hudson.model.Result.SUCCESS
+        )
+    }
+
+    stages {
+
+        stage('Fetch Droplet Info') {
+            steps {
+                // Requires the Copy Artifact plugin.
+                // Pulls droplet-info.json from the exact upstream build
+                // that triggered this run (not just "latest successful").
+                copyArtifacts(
+                    projectName: 'Digital-Ocean/OTA/Create/Create-Droplet',
+                    selector: upstream(fallbackToLastSuccessful: true),
+                    filter: 'scripts/droplet/droplet-info.json',
+                    flatten: true
+                )
+            }
+        }
+
+        stage('Display Server Details') {
+            steps {
+                script {
+                    // Requires the Pipeline Utility Steps plugin.
+                    def droplets = readJSON(file: 'droplet-info.json')
+
+                    if (!droplets || droplets.isEmpty()) {
+                        error("droplet-info.json was empty or missing — nothing to review.")
+                    }
+
+                    def lines = []
+                    droplets.each { d ->
+                        lines << "  - ${d.name}  (${d.ip})  [id: ${d.id}]"
+                    }
+
+                    env.DROPLET_SUMMARY = lines.join("\n")
+                    echo "Servers created by the upstream build:\n${env.DROPLET_SUMMARY}"
+                }
+            }
+        }
+
+        stage('Review') {
+            steps {
+                script {
+                    // input() natively renders as two buttons:
+                    // the "ok" label (Continue) and a built-in Abort.
+                    // No downstream job is triggered either way —
+                    // this is an audit/acknowledgement step only.
+                    def result = input(
+                        id: 'ReviewDropletCreation',
+                        message: "The following server(s) were just created:\n\n${env.DROPLET_SUMMARY}\n\nAcknowledge and close out this review?",
+                        ok: 'Continue',
+                        submitterParameter: 'REVIEWER'
+                    )
+
+                    env.REVIEWER = (result instanceof Map) ? result['REVIEWER'] : null
+                    echo "Reviewed and acknowledged by: ${env.REVIEWER ?: 'unknown'}"
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Review complete.\n${env.DROPLET_SUMMARY ?: ''}\nAcknowledged by: ${env.REVIEWER ?: 'unknown'}"
+        }
+        aborted {
+            echo "Review was cancelled. No further action taken — the droplet(s) remain as created."
+        }
+    }
+}
