@@ -91,6 +91,7 @@ stage('Wait for SSH') {
                 )]) {
                     sh '''
                         ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                            -i $DEPLOY_KEY \\    
                             ${BOOTSTRAP_USER}@${NEW_SERVER_IP} \\
                             DEPLOY_PUBKEY="$(ssh-keygen -y -f $DEPLOY_KEY)" \\
                             'bash -s' <<'REMOTE_EOF'
