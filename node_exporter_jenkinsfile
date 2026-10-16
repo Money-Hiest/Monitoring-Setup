@@ -118,11 +118,11 @@ ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter, \
                               /bin/systemctl status node_exporter, \
                               /bin/systemctl daemon-reload, \
                               /usr/bin/tee /etc/systemd/system/node_exporter.service, \
-                              /bin/chown root\:root /etc/systemd/system/node_exporter.service, \
+                              /bin/chown root.root /etc/systemd/system/node_exporter.service, \
                               /bin/chmod 644 /etc/systemd/system/node_exporter.service, \
                               /bin/mkdir -p /opt/node_exporter, \
                               /bin/cp /tmp/node_exporter-* /opt/node_exporter/, \
-                              /bin/chown -R node_exporter\:node_exporter /opt/node_exporter, \
+                              /bin/chown -R node_exporter.node_exporter /opt/node_exporter, \
                               /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter, \
                               /bin/id node_exporter, \
                               /usr/bin/journalctl -u node_exporter *
