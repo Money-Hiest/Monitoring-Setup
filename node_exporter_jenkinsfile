@@ -39,47 +39,47 @@ pipeline {
         }
 
         // ---------------------------------------------------------------- 3
-stage('Wait for SSH') {
-    steps {
-        withCredentials([sshUserPrivateKey(
-            credentialsId: 'deploy-ssh-key',
-            keyFileVariable: 'DEPLOY_KEY',
-            usernameVariable: 'DEPLOY_KEY_USER'
-        )]) {
-            script {
-                def ready = false
-                for (int i = 1; i <= 30; i++) {
-                    def portOpen = sh(
-                        script: "nc -z -w5 ${env.NEW_SERVER_IP} 22",
-                        returnStatus: true
-                    ) == 0
+        stage('Wait for SSH') {
+            steps {
+                withCredentials([sshUserPrivateKey(
+                    credentialsId: 'deploy-ssh-key',
+                    keyFileVariable: 'DEPLOY_KEY',
+                    usernameVariable: 'DEPLOY_KEY_USER'
+                )]) {
+                    script {
+                        def ready = false
+                        for (int i = 1; i <= 30; i++) {
+                            def portOpen = sh(
+                                script: "nc -z -w5 ${env.NEW_SERVER_IP} 22",
+                                returnStatus: true
+                            ) == 0
 
-                    if (portOpen) {
-                        def sshOk = sh(
-                            script: """
-                                ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-                                    -o BatchMode=yes \
-                                    -i ${DEPLOY_KEY} \
-                                    ${BOOTSTRAP_USER}@${env.NEW_SERVER_IP} 'echo ssh-ok'
-                            """,
-                            returnStatus: true
-                        ) == 0
-                        if (sshOk) {
-                            ready = true
-                            break
+                            if (portOpen) {
+                                def sshOk = sh(
+                                    script: """
+                                        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
+                                            -o BatchMode=yes \
+                                            -i ${DEPLOY_KEY} \
+                                            ${BOOTSTRAP_USER}@${env.NEW_SERVER_IP} 'echo ssh-ok'
+                                    """,
+                                    returnStatus: true
+                                ) == 0
+                                if (sshOk) {
+                                    ready = true
+                                    break
+                                }
+                            }
+                            echo "SSH not ready (attempt ${i}/30), sleeping 10s..."
+                            sleep(time: 10, unit: 'SECONDS')
                         }
+                        if (!ready) {
+                            error("SSH did not become ready on ${env.NEW_SERVER_IP} within 300s")
+                        }
+                        echo "SSH handshake successful on ${env.NEW_SERVER_IP}"
                     }
-                    echo "SSH not ready (attempt ${i}/30), sleeping 10s..."
-                    sleep(time: 10, unit: 'SECONDS')
                 }
-                if (!ready) {
-                    error("SSH did not become ready on ${env.NEW_SERVER_IP} within 300s")
-                }
-                echo "SSH handshake successful on ${env.NEW_SERVER_IP}"
             }
         }
-    }
-}
 
         // ---------------------------------------------------------------- 4
         stage('Create Ansible User') {
@@ -91,7 +91,7 @@ stage('Wait for SSH') {
                 )]) {
                     sh '''
                         ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
-                            -i $DEPLOY_KEY \\    
+                            -i $DEPLOY_KEY \\
                             ${BOOTSTRAP_USER}@${NEW_SERVER_IP} \\
                             DEPLOY_PUBKEY="$(ssh-keygen -y -f $DEPLOY_KEY)" \\
                             'bash -s' <<'REMOTE_EOF'
