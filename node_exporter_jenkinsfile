@@ -24,6 +24,9 @@ pipeline {
 
         stage('Validate Server IP') {
             steps {
+                echo "===================================================="
+                echo "STAGE: Validate Server IP"
+                echo "===================================================="
                 script {
                     if (!env.NEW_SERVER_IP?.trim()) {
                         error("TARGET_IP is empty or null — aborting before wasting the SSH-wait timeout")
@@ -38,6 +41,9 @@ pipeline {
 
         stage('Wait for SSH') {
             steps {
+                echo "===================================================="
+                echo "STAGE: Wait for SSH"
+                echo "===================================================="
                 withCredentials([sshUserPrivateKey(
                     credentialsId: 'deploy-ssh-key',
                     keyFileVariable: 'DEPLOY_KEY',
@@ -96,6 +102,9 @@ pipeline {
         // ----------------------------------------------------------------
         stage('Create Ansible User') {
             steps {
+                echo "===================================================="
+                echo "STAGE: Create Ansible User"
+                echo "===================================================="
                 withCredentials([sshUserPrivateKey(
                     credentialsId: 'deploy-ssh-key',
                     keyFileVariable: 'DEPLOY_KEY',
@@ -113,6 +122,7 @@ pipeline {
                         def template = '''
 set -euo pipefail
 
+echo "---- [1/3] ansible user ----"
 if id "ansible" &>/dev/null; then
     echo "User 'ansible' already exists — continuing"
 else
@@ -120,14 +130,20 @@ else
     echo "User 'ansible' created"
 fi
 
+echo "---- [2/3] authorized_keys ----"
 mkdir -p /home/ansible/.ssh
 chmod 700 /home/ansible/.ssh
 touch /home/ansible/.ssh/authorized_keys
-grep -qxF "__PUBKEY__" /home/ansible/.ssh/authorized_keys \\
-    || echo "__PUBKEY__" >> /home/ansible/.ssh/authorized_keys
+if grep -qxF "__PUBKEY__" /home/ansible/.ssh/authorized_keys; then
+    echo "Deploy public key already present — skipping"
+else
+    echo "__PUBKEY__" >> /home/ansible/.ssh/authorized_keys
+    echo "Deploy public key added"
+fi
 chmod 600 /home/ansible/.ssh/authorized_keys
 chown -R ansible:ansible /home/ansible/.ssh
 
+echo "---- [3/3] restricted sudoers ----"
 cat > /etc/sudoers.d/ansible <<'SUDOERS'
 ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter
 ansible ALL=(root) NOPASSWD: /bin/systemctl start node_exporter
@@ -176,6 +192,9 @@ echo "Ansible user provisioning complete"
         // ----------------------------------------------------------------
         stage('Install Node Exporter') {
             steps {
+                echo "===================================================="
+                echo "STAGE: Install Node Exporter"
+                echo "===================================================="
                 withCredentials([sshUserPrivateKey(
                     credentialsId: 'deploy-ssh-key',
                     keyFileVariable: 'DEPLOY_KEY',
@@ -189,31 +208,37 @@ set -euo pipefail
 
 SUDO="sudo -n"
 
+echo "---- [1/4] node_exporter system user ----"
 if $SUDO id node_exporter &>/dev/null; then
     echo "node_exporter user already exists"
 else
     $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter
+    echo "node_exporter user created"
 fi
 
+echo "---- [2/4] binary ----"
 if [ -x /opt/node_exporter/node_exporter ]; then
     INSTALLED=$(/opt/node_exporter/node_exporter --version 2>&1 | awk 'NR==1{print $3}')
     echo "node_exporter already installed: v${INSTALLED}"
 else
     cd /tmp
-    curl -fL -o ne.tar.gz \\
+    echo "Downloading node_exporter v__NE_VERSION__..."
+    curl -fsSL -o ne.tar.gz \\
         "https://github.com/prometheus/node_exporter/releases/download/v__NE_VERSION__/node_exporter-__NE_VERSION__.linux-amd64.tar.gz"
     tar xzf ne.tar.gz
     $SUDO mkdir -p /opt/node_exporter
     $SUDO cp "/tmp/node_exporter-__NE_VERSION__.linux-amd64/node_exporter" /opt/node_exporter/
     rm -rf ne.tar.gz "node_exporter-__NE_VERSION__.linux-amd64"
-    echo "node_exporter v__NE_VERSION__ installed"
+    echo "node_exporter v__NE_VERSION__ installed to /opt/node_exporter/"
 fi
 $SUDO chown -R node_exporter:node_exporter /opt/node_exporter
 
+echo "---- [3/4] systemd unit ----"
 UNIT=/etc/systemd/system/node_exporter.service
 if [ -f "$UNIT" ]; then
     echo "systemd unit already present"
 else
+    echo "Writing $UNIT"
     $SUDO tee "$UNIT" > /dev/null <<'UNIT_EOF'
 [Unit]
 Description=Prometheus Node Exporter
@@ -239,6 +264,7 @@ UNIT_EOF
     $SUDO chmod 644 "$UNIT"
 fi
 
+echo "---- [4/4] enable + start ----"
 $SUDO systemctl daemon-reload
 $SUDO systemctl enable node_exporter
 $SUDO systemctl start node_exporter
@@ -259,6 +285,9 @@ echo "node_exporter service enabled and started"
 
         stage('Health Check') {
             steps {
+                echo "===================================================="
+                echo "STAGE: Health Check"
+                echo "===================================================="
                 withCredentials([sshUserPrivateKey(
                     credentialsId: 'deploy-ssh-key',
                     keyFileVariable: 'DEPLOY_KEY',
