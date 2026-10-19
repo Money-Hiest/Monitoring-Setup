@@ -10,7 +10,7 @@ pipeline {
     }
 
     environment {
-        NEW_SERVER_IP = "${params.TARGET_IP}"   // kept so your downstream stage names still fit
+        NEW_SERVER_IP = "${params.TARGET_IP}"
         ANSIBLE_USER   = 'ansible'
         BOOTSTRAP_USER = 'root'
         NODE_EXPORTER_VERSION = '1.12.1'
@@ -22,14 +22,12 @@ pipeline {
 
     stages {
 
-        // ---------------------------------------------------------------- 2
         stage('Validate Server IP') {
             steps {
                 script {
                     if (!env.NEW_SERVER_IP?.trim()) {
                         error("TARGET_IP is empty or null — aborting before wasting the SSH-wait timeout")
                     }
-                    // basic IP format sanity check
                     if (!(env.NEW_SERVER_IP ==~ /^(\d{1,3}\.){3}\d{1,3}$/)) {
                         error("TARGET_IP '${env.NEW_SERVER_IP}' does not look like a valid IPv4 address")
                     }
@@ -38,7 +36,6 @@ pipeline {
             }
         }
 
-        // ---------------------------------------------------------------- 3
         stage('Wait for SSH') {
             steps {
                 withCredentials([sshUserPrivateKey(
@@ -57,9 +54,9 @@ pipeline {
                             if (portOpen) {
                                 def sshOk = sh(
                                     script: """
-                                        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \
-                                            -o BatchMode=yes \
-                                            -i ${DEPLOY_KEY} \
+                                        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=10 \\
+                                            -o BatchMode=yes \\
+                                            -i ${DEPLOY_KEY} \\
                                             ${BOOTSTRAP_USER}@${env.NEW_SERVER_IP} 'echo ssh-ok'
                                     """,
                                     returnStatus: true
@@ -81,7 +78,22 @@ pipeline {
             }
         }
 
-        // ---------------------------------------------------------------- 4
+        // ----------------------------------------------------------------
+        // Create Ansible User
+        //
+        // Rewritten from the heredoc-as-ssh-argument approach. That
+        // pattern breaks for any value containing spaces (an SSH public
+        // key always does) because ssh joins every argument after
+        // user@host into one string for the REMOTE shell to re-parse,
+        // and it undoes local quoting. It also silently loses any
+        // env var (like $ANSIBLE_USER) that isn't explicitly forwarded,
+        // since ssh does not export the local shell's environment.
+        //
+        // Fix: resolve the public key locally, write the full remote
+        // script to a local file with the value already substituted,
+        // then stream that file to `bash -s` over stdin. No argument
+        // joining, no remote-side variable dependency.
+        // ----------------------------------------------------------------
         stage('Create Ansible User') {
             steps {
                 withCredentials([sshUserPrivateKey(
@@ -89,62 +101,79 @@ pipeline {
                     keyFileVariable: 'DEPLOY_KEY',
                     usernameVariable: 'DEPLOY_KEY_USER'
                 )]) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
-                            -i $DEPLOY_KEY \\
-                            ${BOOTSTRAP_USER}@${NEW_SERVER_IP} \\
-                            DEPLOY_PUBKEY="$(ssh-keygen -y -f $DEPLOY_KEY)" \\
-                            'bash -s' <<'REMOTE_EOF'
+                    script {
+                        def pubKey = sh(
+                            script: "ssh-keygen -y -f ${DEPLOY_KEY}",
+                            returnStdout: true
+                        ).trim()
+
+                        // Single-quoted Groovy string: NO interpolation,
+                        // NO need to escape $ anywhere. Only __PUBKEY__
+                        // gets substituted, via plain string replace.
+                        def template = '''
 set -euo pipefail
 
-DEPLOY_PUBKEY="${DEPLOY_PUBKEY}"
-
-# --- idempotent user creation ---
-if id "$ANSIBLE_USER" &>/dev/null; then
-    echo "User '$ANSIBLE_USER' already exists — continuing"
+if id "ansible" &>/dev/null; then
+    echo "User 'ansible' already exists — continuing"
 else
-    useradd -m -s /bin/bash "$ANSIBLE_USER"
-    echo "User '$ANSIBLE_USER' created"
+    useradd -m -s /bin/bash "ansible"
+    echo "User 'ansible' created"
 fi
 
-# --- deploy key (idempotent) ---
-mkdir -p /home/"$ANSIBLE_USER"/.ssh
-chmod 700 /home/"$ANSIBLE_USER"/.ssh
-touch /home/"$ANSIBLE_USER"/.ssh/authorized_keys
-grep -qxF "$DEPLOY_PUBKEY" /home/"$ANSIBLE_USER"/.ssh/authorized_keys \\
-    || echo "$DEPLOY_PUBKEY" >> /home/"$ANSIBLE_USER"/.ssh/authorized_keys
-chmod 600 /home/"$ANSIBLE_USER"/.ssh/authorized_keys
-chown -R "$ANSIBLE_USER":"$ANSIBLE_USER" /home/"$ANSIBLE_USER"/.ssh
+mkdir -p /home/ansible/.ssh
+chmod 700 /home/ansible/.ssh
+touch /home/ansible/.ssh/authorized_keys
+grep -qxF "__PUBKEY__" /home/ansible/.ssh/authorized_keys \\
+    || echo "__PUBKEY__" >> /home/ansible/.ssh/authorized_keys
+chmod 600 /home/ansible/.ssh/authorized_keys
+chown -R ansible:ansible /home/ansible/.ssh
 
-# --- restricted sudoers (whitelisted commands only) ---
-cat > /etc/sudoers.d/"$ANSIBLE_USER" <<'SUDOERS'
-ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter, \
-                              /bin/systemctl start node_exporter, \
-                              /bin/systemctl restart node_exporter, \
-                              /bin/systemctl stop node_exporter, \
-                              /bin/systemctl status node_exporter, \
-                              /bin/systemctl daemon-reload, \
-                              /usr/bin/tee /etc/systemd/system/node_exporter.service, \
-                              /bin/chown root.root /etc/systemd/system/node_exporter.service, \
-                              /bin/chmod 644 /etc/systemd/system/node_exporter.service, \
-                              /bin/mkdir -p /opt/node_exporter, \
-                              /bin/cp /tmp/node_exporter-* /opt/node_exporter/, \
-                              /bin/chown -R node_exporter.node_exporter /opt/node_exporter, \
-                              /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter, \
-                              /bin/id node_exporter, \
+cat > /etc/sudoers.d/ansible <<'SUDOERS'
+ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter, \\
+                              /bin/systemctl start node_exporter, \\
+                              /bin/systemctl restart node_exporter, \\
+                              /bin/systemctl stop node_exporter, \\
+                              /bin/systemctl status node_exporter, \\
+                              /bin/systemctl daemon-reload, \\
+                              /usr/bin/tee /etc/systemd/system/node_exporter.service, \\
+                              /bin/chown root:root /etc/systemd/system/node_exporter.service, \\
+                              /bin/chmod 644 /etc/systemd/system/node_exporter.service, \\
+                              /bin/mkdir -p /opt/node_exporter, \\
+                              /bin/cp /tmp/node_exporter-* /opt/node_exporter/, \\
+                              /bin/chown -R node_exporter:node_exporter /opt/node_exporter, \\
+                              /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter, \\
+                              /bin/id node_exporter, \\
                               /usr/bin/journalctl -u node_exporter *
 SUDOERS
-chmod 440 /etc/sudoers.d/"$ANSIBLE_USER"
-visudo -cf /etc/sudoers.d/"$ANSIBLE_USER"
+chmod 440 /etc/sudoers.d/ansible
+visudo -cf /etc/sudoers.d/ansible
 
 echo "Ansible user provisioning complete"
-REMOTE_EOF
-                    '''
+'''
+
+                        writeFile file: 'ensure_ansible_user.sh', text: template.replace('__PUBKEY__', pubKey)
+
+                        sh """
+                            ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                                -i ${DEPLOY_KEY} \\
+                                ${BOOTSTRAP_USER}@${env.NEW_SERVER_IP} 'bash -s' < ensure_ansible_user.sh
+                        """
+                    }
                 }
             }
         }
 
-        // ---------------------------------------------------------------- 5
+        // ----------------------------------------------------------------
+        // Install Node Exporter
+        //
+        // Same writeFile + stdin pattern. Also fixes two sudoers
+        // mismatches from the original: cp now uses the absolute
+        // /tmp/... path the whitelist expects (the script had cd'd into
+        // /tmp and used a relative path, which sudoers won't match),
+        // and systemctl enable + start are issued as two separate sudo
+        // calls to match the two separate whitelist entries, instead of
+        // one combined `enable --now` that matches neither.
+        // ----------------------------------------------------------------
         stage('Install Node Exporter') {
             steps {
                 withCredentials([sshUserPrivateKey(
@@ -152,40 +181,35 @@ REMOTE_EOF
                     keyFileVariable: 'DEPLOY_KEY',
                     usernameVariable: 'DEPLOY_KEY_USER'
                 )]) {
-                    sh '''
-                        ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
-                            -i $DEPLOY_KEY \\
-                            ${ANSIBLE_USER}@${NEW_SERVER_IP} \\
-                            NE_VERSION="${NODE_EXPORTER_VERSION}" \\
-                            'bash -s' <<'REMOTE_EOF'
+                    script {
+                        def neVersion = env.NODE_EXPORTER_VERSION
+
+                        def template = '''
 set -euo pipefail
 
-SUDO="sudo -n"   # fails loudly if a command isn't whitelisted
+SUDO="sudo -n"
 
-# --- system user (idempotent) ---
 if $SUDO id node_exporter &>/dev/null; then
     echo "node_exporter user already exists"
 else
     $SUDO useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter
 fi
 
-# --- binary (pinned, skip if already installed) ---
 if [ -x /opt/node_exporter/node_exporter ]; then
     INSTALLED=$(/opt/node_exporter/node_exporter --version 2>&1 | awk 'NR==1{print $3}')
     echo "node_exporter already installed: v${INSTALLED}"
 else
     cd /tmp
     curl -fL -o ne.tar.gz \\
-        "https://github.com/prometheus/node_exporter/releases/download/v${NE_VERSION}/node_exporter-${NE_VERSION}.linux-amd64.tar.gz"
+        "https://github.com/prometheus/node_exporter/releases/download/v__NE_VERSION__/node_exporter-__NE_VERSION__.linux-amd64.tar.gz"
     tar xzf ne.tar.gz
     $SUDO mkdir -p /opt/node_exporter
-    $SUDO cp "node_exporter-${NE_VERSION}.linux-amd64/node_exporter" /opt/node_exporter/
-    rm -rf ne.tar.gz "node_exporter-${NE_VERSION}.linux-amd64"
-    echo "node_exporter v${NE_VERSION} installed"
+    $SUDO cp "/tmp/node_exporter-__NE_VERSION__.linux-amd64/node_exporter" /opt/node_exporter/
+    rm -rf ne.tar.gz "node_exporter-__NE_VERSION__.linux-amd64"
+    echo "node_exporter v__NE_VERSION__ installed"
 fi
 $SUDO chown -R node_exporter:node_exporter /opt/node_exporter
 
-# --- systemd unit (write if missing) ---
 UNIT=/etc/systemd/system/node_exporter.service
 if [ -f "$UNIT" ]; then
     echo "systemd unit already present"
@@ -200,9 +224,7 @@ After=network-online.target
 User=node_exporter
 Group=node_exporter
 Type=simple
-ExecStart=/opt/node_exporter/node_exporter \\
-  --web.listen-address=:9100 \\
-  --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|run|var/lib/docker/.+)($|/)'
+ExecStart=/opt/node_exporter/node_exporter --web.listen-address=:9100 --collector.filesystem.mount-points-exclude='^/(sys|proc|dev|run|var/lib/docker/.+)($|/)'
 Restart=always
 RestartSec=5
 NoNewPrivileges=true
@@ -218,15 +240,23 @@ UNIT_EOF
 fi
 
 $SUDO systemctl daemon-reload
-$SUDO systemctl enable --now node_exporter
+$SUDO systemctl enable node_exporter
+$SUDO systemctl start node_exporter
 echo "node_exporter service enabled and started"
-REMOTE_EOF
-                    '''
+'''
+
+                        writeFile file: 'install_node_exporter.sh', text: template.replace('__NE_VERSION__', neVersion)
+
+                        sh """
+                            ssh -o StrictHostKeyChecking=no -o BatchMode=yes \\
+                                -i ${DEPLOY_KEY} \\
+                                ${ANSIBLE_USER}@${env.NEW_SERVER_IP} 'bash -s' < install_node_exporter.sh
+                        """
+                    }
                 }
             }
         }
 
-        // ---------------------------------------------------------------- 6
         stage('Health Check') {
             steps {
                 withCredentials([sshUserPrivateKey(
@@ -260,12 +290,10 @@ REMOTE_EOF
         }
     }
 
-    // ------------------------------------------------------------------ 7
     post {
         success {
             echo "Server ${env.NEW_SERVER_IP} provisioned + monitored (node_exporter :9100)"
         }
-        // ---------------------------------------------------------------- 8
         failure {
             script {
                 if (env.NEW_SERVER_IP?.trim()) {
