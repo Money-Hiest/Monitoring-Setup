@@ -129,21 +129,21 @@ chmod 600 /home/ansible/.ssh/authorized_keys
 chown -R ansible:ansible /home/ansible/.ssh
 
 cat > /etc/sudoers.d/ansible <<'SUDOERS'
-ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter, \\
-                              /bin/systemctl start node_exporter, \\
-                              /bin/systemctl restart node_exporter, \\
-                              /bin/systemctl stop node_exporter, \\
-                              /bin/systemctl status node_exporter, \\
-                              /bin/systemctl daemon-reload, \\
-                              /usr/bin/tee /etc/systemd/system/node_exporter.service, \\
-                              /bin/chown root:root /etc/systemd/system/node_exporter.service, \\
-                              /bin/chmod 644 /etc/systemd/system/node_exporter.service, \\
-                              /bin/mkdir -p /opt/node_exporter, \\
-                              /bin/cp /tmp/node_exporter-* /opt/node_exporter/, \\
-                              /bin/chown -R node_exporter:node_exporter /opt/node_exporter, \\
-                              /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter, \\
-                              /bin/id node_exporter, \\
-                              /usr/bin/journalctl -u node_exporter *
+ansible ALL=(root) NOPASSWD: /bin/systemctl enable node_exporter
+ansible ALL=(root) NOPASSWD: /bin/systemctl start node_exporter
+ansible ALL=(root) NOPASSWD: /bin/systemctl restart node_exporter
+ansible ALL=(root) NOPASSWD: /bin/systemctl stop node_exporter
+ansible ALL=(root) NOPASSWD: /bin/systemctl status node_exporter
+ansible ALL=(root) NOPASSWD: /bin/systemctl daemon-reload
+ansible ALL=(root) NOPASSWD: /usr/bin/tee /etc/systemd/system/node_exporter.service
+ansible ALL=(root) NOPASSWD: /bin/chown root:root /etc/systemd/system/node_exporter.service
+ansible ALL=(root) NOPASSWD: /bin/chmod 644 /etc/systemd/system/node_exporter.service
+ansible ALL=(root) NOPASSWD: /bin/mkdir -p /opt/node_exporter
+ansible ALL=(root) NOPASSWD: /bin/cp /tmp/node_exporter-* /opt/node_exporter/
+ansible ALL=(root) NOPASSWD: /bin/chown -R node_exporter:node_exporter /opt/node_exporter
+ansible ALL=(root) NOPASSWD: /usr/sbin/useradd --system --no-create-home --shell /usr/sbin/nologin node_exporter
+ansible ALL=(root) NOPASSWD: /bin/id node_exporter
+ansible ALL=(root) NOPASSWD: /usr/bin/journalctl -u node_exporter *
 SUDOERS
 chmod 440 /etc/sudoers.d/ansible
 visudo -cf /etc/sudoers.d/ansible
