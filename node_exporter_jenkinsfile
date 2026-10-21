@@ -322,6 +322,9 @@ echo "node_exporter service enabled and started"
     post {
         success {
             echo "Server ${env.NEW_SERVER_IP} provisioned + monitored (node_exporter :9100)"
+            build job: 'Digital-Ocean/AIL-Mix/Register-Grafana-Target',
+                  parameters: [string(name: 'TARGET_IP', value: env.NEW_SERVER_IP)],
+                  wait: false
         }
         failure {
             script {
