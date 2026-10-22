@@ -7,6 +7,16 @@ pipeline {
             defaultValue: '',
             description: 'IP address of the existing DigitalOcean droplet to configure'
         )
+        string(
+            name: 'SERVER_NAME',
+            defaultValue: '',
+            description: 'Droplet name, forwarded through to Register-Grafana-Target as the target servername'
+        )
+        string(
+            name: 'PROJECT_NAME',
+            defaultValue: '',
+            description: 'DigitalOcean project name, forwarded through to Register-Grafana-Target to resolve the target file/group'
+        )
     }
 
     environment {
@@ -323,7 +333,11 @@ echo "node_exporter service enabled and started"
         success {
             echo "Server ${env.NEW_SERVER_IP} provisioned + monitored (node_exporter :9100)"
             build job: 'Digital-Ocean/AIL-Mix/Register-Grafana-Target',
-                  parameters: [string(name: 'TARGET_IP', value: env.NEW_SERVER_IP)],
+                  parameters: [
+                      string(name: 'TARGET_IP', value: env.NEW_SERVER_IP),
+                      string(name: 'SERVER_NAME', value: params.SERVER_NAME),
+                      string(name: 'PROJECT_NAME', value: params.PROJECT_NAME)
+                  ],
                   wait: false
         }
         failure {
