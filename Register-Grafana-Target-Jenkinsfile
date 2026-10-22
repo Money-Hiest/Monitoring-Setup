@@ -1,0 +1,174 @@
+pipeline {
+    agent any
+
+    parameters {
+        string(
+            name: 'TARGET_IP',
+            defaultValue: '',
+            description: 'IP address of the server to register as a Prometheus target'
+        )
+        string(
+            name: 'SERVER_NAME',
+            defaultValue: '',
+            description: 'Droplet/server name — used as the servername label'
+        )
+        string(
+            name: 'PROJECT_NAME',
+            defaultValue: '',
+            description: 'DigitalOcean project name — determines the target file and group label (must match an existing project exactly, case-sensitive)'
+        )
+    }
+
+    environment {
+        GRAFANA_HOST = '167.71.237.241'
+
+        // Separate, more restricted credential domain from the droplet
+        // deploy-ssh-key: this key's sudoers grant on AIL-DO-Grafana is
+        // scoped to exactly register-do-target, register-prometheus-target,
+        // and `systemctl restart prometheus` -- nothing else.
+        GRAFANA_SSH_USER    = 'jenkins-monitoring'
+        GRAFANA_SSH_KEY     = '/var/lib/jenkins/.ssh/grafana_deploy_ed25519'
+        GRAFANA_KNOWN_HOSTS = '/var/lib/jenkins/.ssh/known_hosts'
+
+        ASSETS_DIR = '/opt/prometheus/server/targets/assets'
+    }
+
+    options {
+        timestamps()
+        timeout(time: 10, unit: 'MINUTES')
+    }
+
+    stages {
+
+        stage('Validate') {
+            steps {
+                echo "===================================================="
+                echo "STAGE: Validate"
+                echo "===================================================="
+                script {
+                    if (!env.TARGET_IP?.trim()) {
+                        error("TARGET_IP is empty -- nothing to register.")
+                    }
+                    if (!(env.TARGET_IP ==~ /^(\d{1,3}\.){3}\d{1,3}$/)) {
+                        error("TARGET_IP '${env.TARGET_IP}' does not look like a valid IPv4 address")
+                    }
+                    if (!env.SERVER_NAME?.trim()) {
+                        error("SERVER_NAME is empty -- nothing to label this target with.")
+                    }
+                    if (!(env.SERVER_NAME ==~ /^[A-Za-z0-9._-]+$/)) {
+                        error("SERVER_NAME '${env.SERVER_NAME}' contains characters that aren't safe for a label/SSH command.")
+                    }
+                    if (!env.PROJECT_NAME?.trim()) {
+                        error("PROJECT_NAME is empty -- cannot determine target file or group.")
+                    }
+
+                    echo "Will register ${env.TARGET_IP} (${env.SERVER_NAME}) for project '${env.PROJECT_NAME}' on ${env.GRAFANA_HOST}"
+                }
+            }
+        }
+
+        stage('Resolve Target File') {
+            steps {
+                echo "===================================================="
+                echo "STAGE: Resolve Target File"
+                echo "===================================================="
+                script {
+                    // Deterministic rule: lowercase the project name, replace
+                    // anything that isn't a-z0-9 with a hyphen, trim leading/
+                    // trailing hyphens, append "-do" since this pipeline only
+                    // ever creates DigitalOcean targets.
+                    def fileKey = env.PROJECT_NAME.trim().toLowerCase()
+                        .replaceAll(/[^a-z0-9]+/, '-')
+                        .replaceAll(/^-+|-+$/, '')
+
+                    if (!fileKey) {
+                        error("PROJECT_NAME '${env.PROJECT_NAME}' did not produce a usable filename after sanitization.")
+                    }
+
+                    env.TARGET_FILE = "target-${fileKey}-do.yml"
+                    env.TARGET_GROUP = env.PROJECT_NAME.trim()
+
+                    echo "Resolved target file: ${env.TARGET_FILE}"
+                    echo "Resolved group: ${env.TARGET_GROUP}"
+
+                    // Fail clearly here rather than letting a missing file
+                    // surface as a generic SSH/script error later.
+                    def exists = sh(
+                        script: """
+                            ssh -o StrictHostKeyChecking=yes \\
+                                -o UserKnownHostsFile=${GRAFANA_KNOWN_HOSTS} \\
+                                -o BatchMode=yes \\
+                                -i ${GRAFANA_SSH_KEY} \\
+                                ${GRAFANA_SSH_USER}@${GRAFANA_HOST} \\
+                                'test -f ${ASSETS_DIR}/${env.TARGET_FILE}'
+                        """,
+                        returnStatus: true
+                    ) == 0
+
+                    if (!exists) {
+                        error("Target file ${env.TARGET_FILE} does not exist on ${env.GRAFANA_HOST} (${ASSETS_DIR}). Create it once before this project can auto-register, then re-run.")
+                    }
+
+                    echo "Confirmed ${env.TARGET_FILE} exists."
+                }
+            }
+        }
+
+        stage('Register Target') {
+            steps {
+                echo "===================================================="
+                echo "STAGE: Register Target"
+                echo "===================================================="
+                script {
+                    def targetFile = env.TARGET_FILE
+                    def targetPort = '9100'
+                    def targetIp   = env.TARGET_IP.trim()
+                    def targetName = env.SERVER_NAME.trim()
+                    def targetGroup = env.TARGET_GROUP
+
+                    echo "Registering ${targetIp}:${targetPort} as '${targetName}' (group: ${targetGroup}) in ${targetFile}..."
+
+                    sh """
+                        ssh -o StrictHostKeyChecking=yes \\
+                            -o UserKnownHostsFile=${GRAFANA_KNOWN_HOSTS} \\
+                            -o BatchMode=yes \\
+                            -i ${GRAFANA_SSH_KEY} \\
+                            ${GRAFANA_SSH_USER}@${GRAFANA_HOST} \\
+                            'sudo -n /usr/local/sbin/register-prometheus-target "${targetFile}" "${targetIp}" "${targetPort}" "${targetName}" "${targetGroup}"'
+                    """
+
+                    echo "Restarting Prometheus..."
+
+                    sh """
+                        ssh -o StrictHostKeyChecking=yes \\
+                            -o UserKnownHostsFile=${GRAFANA_KNOWN_HOSTS} \\
+                            -o BatchMode=yes \\
+                            -i ${GRAFANA_SSH_KEY} \\
+                            ${GRAFANA_SSH_USER}@${GRAFANA_HOST} \\
+                            'sudo -n /usr/bin/systemctl restart prometheus'
+                    """
+
+                    sh """
+                        ssh -o StrictHostKeyChecking=yes \\
+                            -o UserKnownHostsFile=${GRAFANA_KNOWN_HOSTS} \\
+                            -o BatchMode=yes \\
+                            -i ${GRAFANA_SSH_KEY} \\
+                            ${GRAFANA_SSH_USER}@${GRAFANA_HOST} \\
+                            'systemctl is-active prometheus'
+                    """
+
+                    echo "Registered ${targetIp}:${targetPort} as '${targetName}' (group: ${targetGroup}) in ${targetFile}; Prometheus restarted and active."
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Grafana target registration complete for ${env.TARGET_IP} (${env.SERVER_NAME}, project: ${env.PROJECT_NAME})."
+        }
+        failure {
+            echo "Grafana target registration failed for ${env.TARGET_IP} -- no changes assumed safe; check the stage logs above."
+        }
+    }
+}
